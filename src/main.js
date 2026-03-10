@@ -383,6 +383,7 @@ await Actor.main(async () => {
         for (let listingIndex = 0; listingIndex < listingsToProcess; listingIndex++) {
             console.log(`\n🔍 Processing listing ${listingIndex + 1}/${listingsToProcess}...`);
 
+            let searchPageUrl = page.url(); // declared outside try so catch block can access it
             try {
                 // Re-query the listing link by index (DOM may have changed)
                 const listingHref = await page.evaluate((index) => {
@@ -395,7 +396,7 @@ await Actor.main(async () => {
                     continue;
                 }
 
-                const searchPageUrl = page.url();
+                searchPageUrl = page.url();
                 let detailLoaded = false;
 
                 // PRIMARY: Navigate directly to listing URL (works when CarGurus opens new tab)
@@ -563,8 +564,10 @@ await Actor.main(async () => {
                     await page.goBack();
                 }
 
-                // Wait for search results to load
-                await page.waitForSelector('a[data-testid="car-blade-link"]', { timeout: 10000 });
+                // Scroll to trigger listings to load (ads/lazy load can delay them)
+                await page.evaluate(() => window.scrollTo(0, 500));
+                await page.waitForTimeout(1000);
+                await page.waitForSelector('a[data-testid="car-blade-link"]', { timeout: 20000 });
                 console.log(`  ✅ Back to search results`);
 
                 // Random delay between cars
