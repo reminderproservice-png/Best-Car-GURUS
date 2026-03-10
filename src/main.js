@@ -385,34 +385,52 @@ await Actor.main(async () => {
 
             try {
                 // Re-query the listing link by index (DOM may have changed)
-                const linkExists = await page.evaluate((index) => {
+                const listingHref = await page.evaluate((index) => {
                     const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
-                    return links[index] ? true : false;
+                    return links[index] ? links[index].href : null;
                 }, listingIndex);
 
-                if (!linkExists) {
+                if (!listingHref) {
                     console.log(`  ⚠️ Listing ${listingIndex + 1} not found in DOM - skipping`);
                     continue;
                 }
 
-                // Click the listing to trigger SPA detail view
-                await page.evaluate((index) => {
-                    const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
-                    links[index].click();
-                }, listingIndex);
+                const searchPageUrl = page.url();
+                let detailLoaded = false;
 
-                console.log(`  ✅ Clicked listing ${listingIndex + 1}`);
-
-                // Wait for SPA detail view to load
+                // PRIMARY: Navigate directly to listing URL (works when CarGurus opens new tab)
                 try {
-                    await page.waitForSelector('div[data-cg-ft="listing-vdp-stats"]', { timeout: 10000 });
-                    console.log(`  ✅ Detail view loaded`);
+                    console.log(`  🔗 Navigating directly to listing...`);
+                    await page.goto(listingHref, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                    await page.waitForSelector('h1[data-cg-ft="vdp-listing-title"]', { timeout: 15000 });
+                    console.log(`  ✅ Detail page loaded`);
+                    detailLoaded = true;
                 } catch (e) {
-                    console.log(`  ⚠️ Detail view not loaded: ${e.message}`);
-                    // Try to go back to search results
-                    await page.goBack();
-                    await page.waitForTimeout(2000);
-                    continue;
+                    console.log(`  ⚠️ Direct navigation failed: ${e.message} — trying SPA click...`);
+                    // Return to search results before fallback
+                    try {
+                        await page.goto(searchPageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        await page.waitForSelector('a[data-testid="car-blade-link"]', { timeout: 10000 });
+                    } catch (_) {}
+                }
+
+                // FALLBACK: SPA click approach (works when CarGurus loads detail in same page)
+                if (!detailLoaded) {
+                    try {
+                        await page.evaluate((index) => {
+                            const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
+                            links[index].click();
+                        }, listingIndex);
+                        console.log(`  ✅ Clicked listing ${listingIndex + 1}`);
+                        await page.waitForSelector('div[data-cg-ft="listing-vdp-stats"]', { timeout: 10000 });
+                        console.log(`  ✅ Detail view loaded (SPA)`);
+                        detailLoaded = true;
+                    } catch (e) {
+                        console.log(`  ⚠️ SPA approach also failed: ${e.message} — skipping listing`);
+                        try { await page.goBack(); } catch (_) {}
+                        await page.waitForTimeout(2000);
+                        continue;
+                    }
                 }
 
                 // Small delay to let detail view fully render
@@ -539,7 +557,11 @@ await Actor.main(async () => {
 
                 // Navigate back to search results
                 console.log(`  ← Going back to search results...`);
-                await page.goBack();
+                try {
+                    await page.goto(searchPageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                } catch (_) {
+                    await page.goBack();
+                }
 
                 // Wait for search results to load
                 await page.waitForSelector('a[data-testid="car-blade-link"]', { timeout: 10000 });
