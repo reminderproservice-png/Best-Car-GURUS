@@ -574,7 +574,7 @@ await Actor.main(async () => {
                 console.error(`❌ Error processing listing ${listingIndex + 1}:`, error.message);
                 // Try to go back to search results if error occurred
                 try {
-                    await page.goBack();
+                    await page.goto(searchPageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
                     await page.waitForTimeout(2000);
                 } catch (backError) {
                     console.error(`  ⚠️ Could not navigate back: ${backError.message}`);
