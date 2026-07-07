@@ -237,6 +237,26 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
+        const bodyTypeGroupIds = [];
+        for (const bodyType of bodyTypes) {
+            if (bodyType.includes('SUV')) bodyTypeGroupIds.push('7');
+            if (bodyType.includes('Pickup')) bodyTypeGroupIds.push('5');
+        }
+
+        if (bodyTypeGroupIds.length > 0) {
+            const url = new URL(page.url());
+            url.searchParams.delete('bodyTypeGroupIds');
+            for (const id of [...new Set(bodyTypeGroupIds)]) {
+                url.searchParams.append('bodyTypeGroupIds', id);
+            }
+
+            console.log(`  Applying body types through URL params: ${url.searchParams.getAll('bodyTypeGroupIds').join(', ')}`);
+            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await waitForFilterUiToSettle(page, 3000);
+            console.log(`  Body type URL applied: ${page.url()}`);
+            return true;
+        }
+
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
