@@ -9,6 +9,44 @@ chromium.use(StealthPlugin());
 // FILTER AUTOMATION HELPERS
 // ============================================
 
+const DOM_RETRY_ERRORS = [
+    'Element is not attached to the DOM',
+    'element was detached from the DOM',
+    'Target closed',
+    'Execution context was destroyed',
+];
+
+function isRetryableDomError(error) {
+    const message = error?.message || String(error);
+    return DOM_RETRY_ERRORS.some((text) => message.includes(text));
+}
+
+async function waitForFilterUiToSettle(page, timeout = 1500) {
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(timeout);
+}
+
+async function retryDomAction(page, description, action, retries = 5) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            return await action(attempt);
+        } catch (error) {
+            lastError = error;
+
+            if (!isRetryableDomError(error) && attempt >= 2) {
+                throw error;
+            }
+
+            console.log(`  ⚠️ ${description} retry ${attempt}/${retries}: ${error.message}`);
+            await waitForFilterUiToSettle(page, 1000 + attempt * 500);
+        }
+    }
+
+    throw lastError;
+}
+
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
@@ -26,12 +64,11 @@ async function applyFilters(page, filters, searchRadius) {
 }
 
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        const trigger = page.locator(triggerSelector).first();
+        const content = page.locator(contentSelector).first();
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
+        await trigger.waitFor({ state: 'visible', timeout: 90000 });
         const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
         const contentState = await content.getAttribute('data-state').catch(() => null);
 
@@ -40,12 +77,21 @@ async function ensureAccordionOpen(page, triggerSelector, contentSelector, name)
             return true;
         }
 
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
-        await page.waitForTimeout(800);
+        try {
+            await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
+            await trigger.click({ timeout: 15000, force: true });
+            await waitForFilterUiToSettle(page, 800);
+        } catch (error) {
+            if (!isRetryableDomError(error)) throw error;
+            console.log(`  Accordion changed while clicking ${name}; retrying...`);
+            await waitForFilterUiToSettle(page, 1200);
+            continue;
+        }
 
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
+        const updatedTrigger = page.locator(triggerSelector).first();
+        const updatedContent = page.locator(contentSelector).first();
+        const updatedExpanded = await updatedTrigger.getAttribute('aria-expanded').catch(() => null);
+        const updatedContentState = await updatedContent.getAttribute('data-state').catch(() => null);
 
         if (updatedExpanded === 'true' || updatedContentState === 'open') {
             console.log(`  ✅ Opened ${name} accordion`);
@@ -140,10 +186,25 @@ async function setSearchRadius(page, searchRadius) {
             console.log(`  🌍 Nationwide option resolved to value: ${optionValue}`);
         }
 
-        await dropdown.selectOption(optionValue, { timeout: 90000 });
-        await page.waitForTimeout(2000);
+        await retryDomAction(page, 'Selecting search radius', async () => {
+            const freshDropdown = await findDistanceDropdown(page);
+            if (!freshDropdown) {
+                throw new Error('Distance dropdown disappeared before selection');
+            }
 
-        const selectedValue = await dropdown.inputValue();
+            await freshDropdown.selectOption(optionValue, { timeout: 90000 });
+            await waitForFilterUiToSettle(page, 2500);
+            return true;
+        });
+
+        const selectedValue = await retryDomAction(page, 'Verifying search radius', async () => {
+            const verifiedDropdown = await findDistanceDropdown(page);
+            if (!verifiedDropdown) {
+                throw new Error('Distance dropdown disappeared after selection');
+            }
+
+            return await verifiedDropdown.inputValue();
+        });
 
         if (selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
@@ -174,30 +235,39 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            await retryDomAction(page, `${groupName}: selecting ${labelText}`, async () => {
+                const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+                await checkbox.waitFor({ state: 'visible', timeout: 90000 });
+                await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                const checkedBefore = await checkbox.getAttribute('aria-checked');
+                if (checkedBefore === 'true') {
+                    return true;
+                }
+
+                await checkbox.click({ timeout: 30000, force: true });
+                await waitForFilterUiToSettle(page, 1200);
+
+                const freshCheckbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+                await freshCheckbox.waitFor({ state: 'visible', timeout: 30000 });
+                const checkedAfter = await freshCheckbox.getAttribute('aria-checked');
+                if (checkedAfter !== 'true') {
+                    throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+                }
+
                 return true;
-            }
-
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
+            });
 
             console.log(`  ✅ ${groupName}: Added ${labelText}`);
+            await waitForFilterUiToSettle(page, 1000);
+            await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
             return true;
         };
 
         for (const bodyType of bodyTypes) {
+            await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
+
             if (bodyType.includes('SUV')) {
                 await clickCheckboxByAriaLabelContains('Body type', 'SUV / Crossover');
             }
@@ -247,32 +317,39 @@ async function clickMakeCheckbox(page, make) {
     ];
 
     for (const selector of selectors) {
-        const locator = page.locator(selector).first();
-
         try {
-            await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-            await page.waitForTimeout(300);
+            const clicked = await retryDomAction(page, `Selecting make ${make}`, async () => {
+                const locator = page.locator(selector).first();
 
-            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
+                await locator.waitFor({ state: 'visible', timeout: 3000 });
+                await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+                await page.waitForTimeout(300);
 
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${make} already selected`);
-                return true;
-            }
+                const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
+                const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
 
-            await locator.click({ timeout: 10000, force: true });
-            await page.waitForTimeout(700);
+                if (checkedBefore === 'true') {
+                    return true;
+                }
 
-            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
+                await locator.click({ timeout: 10000, force: true });
+                await waitForFilterUiToSettle(page, 1200);
 
-            if (checkedAfter === 'true') {
+                const freshCheckbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
+                const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
+
+                if (checkedAfter === 'true') {
+                    return true;
+                }
+
+                console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
+                return false;
+            }, 3);
+
+            if (clicked) {
                 console.log(`  ✅ Added ${make} using selector: ${selector}`);
                 return true;
             }
-
-            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
         } catch (_) {
             // Try next selector
         }
@@ -334,12 +411,12 @@ async function applyPriceFilter(page) {
 
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
-        // Find the MINIMUM slider specifically (not maximum)
-        const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
-        await minSlider.waitFor({ state: 'visible', timeout: 90000 });
-
-        // Click on the minimum slider to focus it
-        await minSlider.click({ timeout: 90000 });
+        await retryDomAction(page, 'Focusing minimum price slider', async () => {
+            const minSlider = page.locator('[role="slider"][aria-label="Minimum"]').first();
+            await minSlider.waitFor({ state: 'visible', timeout: 90000 });
+            await minSlider.click({ timeout: 30000, force: true });
+            return true;
+        });
         await page.waitForTimeout(500);
 
         // Set the slider value to 24 (which equals $35,000 CAD)
@@ -372,8 +449,24 @@ async function applyDealRatingFilter(page, dealRatings) {
         // Click checkboxes for each deal rating
         for (const rating of dealRatings) {
             try {
-                // Click with 6-minute timeout
-                await page.click(`#FILTER\\.DEAL_RATING\\.${rating}`, { timeout: 90000 });
+                await retryDomAction(page, `Selecting deal rating ${rating}`, async () => {
+                    const checkbox = page.locator(`#FILTER\\.DEAL_RATING\\.${rating}`).first();
+                    await checkbox.waitFor({ state: 'visible', timeout: 90000 });
+
+                    const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
+                    if (checkedBefore === 'true') return true;
+
+                    await checkbox.click({ timeout: 30000, force: true });
+                    await waitForFilterUiToSettle(page, 800);
+
+                    const freshCheckbox = page.locator(`#FILTER\\.DEAL_RATING\\.${rating}`).first();
+                    const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
+                    if (checkedAfter !== 'true') {
+                        throw new Error(`clicked ${rating}, but aria-checked is ${checkedAfter}`);
+                    }
+
+                    return true;
+                });
                 console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
                 await page.waitForTimeout(300);
             } catch (error) {
