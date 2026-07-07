@@ -246,11 +246,9 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         if (bodyTypeGroupIds.length > 0) {
             const url = new URL(page.url());
             url.searchParams.delete('bodyTypeGroupIds');
-            for (const id of [...new Set(bodyTypeGroupIds)]) {
-                url.searchParams.append('bodyTypeGroupIds', id);
-            }
+            url.searchParams.set('bodyTypeGroupIds', [...new Set(bodyTypeGroupIds)].sort((a, b) => Number(a) - Number(b)).join(','));
 
-            console.log(`  Applying body types through URL params: ${url.searchParams.getAll('bodyTypeGroupIds').join(', ')}`);
+            console.log(`  Applying body types through URL params: ${url.searchParams.get('bodyTypeGroupIds')}`);
             await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
             await waitForFilterUiToSettle(page, 3000);
             console.log(`  Body type URL applied: ${page.url()}`);
@@ -328,6 +326,15 @@ function normalizeMakeName(make) {
     return map[key] || make.trim().replace(/\s+/g, '_');
 }
 
+const MAKE_MODEL_TRIM_PATHS = {
+    cadillac: 'm22',
+    jeep: 'm32',
+    dodge: 'm24',
+    ford: 'm2',
+    gmc: 'm26',
+    chevrolet: 'm1',
+};
+
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
@@ -386,6 +393,22 @@ async function clickMakeCheckbox(page, make) {
 async function applyMakeFilter(page, makes) {
     try {
         console.log(`🏭 Setting makes: ${makes.join(', ')}`);
+
+        const makeModelTrimPaths = makes
+            .map((make) => MAKE_MODEL_TRIM_PATHS[make.trim().toLowerCase()])
+            .filter(Boolean);
+
+        if (makeModelTrimPaths.length > 0) {
+            const url = new URL(page.url());
+            url.searchParams.set('makeModelTrimPaths', [...new Set(makeModelTrimPaths)].join(','));
+            url.searchParams.set('nonShippableBaseline', '1104');
+
+            console.log(`  Applying makes through URL params: ${url.searchParams.get('makeModelTrimPaths')}`);
+            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await waitForFilterUiToSettle(page, 3000);
+            console.log(`  Make URL applied: ${page.url()}`);
+            return true;
+        }
 
         await ensureAccordionOpen(page, '#MakeAndModel-accordion-trigger', '#MakeAndModel-accordion-content', 'Make & Model');
 
@@ -469,6 +492,17 @@ async function applyDealRatingFilter(page, dealRatings) {
     try {
         console.log(`⭐ Setting deal ratings: ${dealRatings.join(', ')}`);
 
+        if (dealRatings && dealRatings.length > 0) {
+            const url = new URL(page.url());
+            url.searchParams.set('dealRatings', [...new Set(dealRatings)].join(','));
+
+            console.log(`  Applying deal ratings through URL params: ${url.searchParams.get('dealRatings')}`);
+            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await waitForFilterUiToSettle(page, 3000);
+            console.log(`  Deal rating URL applied: ${page.url()}`);
+            return true;
+        }
+
         await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
         // Click checkboxes for each deal rating
@@ -521,11 +555,11 @@ await Actor.main(async () => {
         maxPages = 73,
         maxResults = 24,
         filters = {
-            makes: ['Ford', 'GMC', 'Chevrolet', 'Cadillac'],
+            makes: ['Cadillac', 'Jeep', 'Dodge', 'Ford', 'GMC', 'Chevrolet'],
             bodyTypes: ['SUV / Crossover', 'Pickup Truck'],
             maxMileage: 140000,
             minPrice: 35000,
-            dealRatings: ['GREAT_PRICE', 'GOOD_PRICE', 'FAIR_PRICE']
+            dealRatings: ['GREAT_PRICE', 'GOOD_PRICE']
         }
     } = input;
 
