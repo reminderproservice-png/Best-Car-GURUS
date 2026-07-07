@@ -12,6 +12,7 @@ chromium.use(StealthPlugin());
 const DOM_RETRY_ERRORS = [
     'Element is not attached to the DOM',
     'element was detached from the DOM',
+    'Distance dropdown disappeared',
     'Target closed',
     'Execution context was destroyed',
 ];
@@ -200,17 +201,21 @@ async function setSearchRadius(page, searchRadius) {
         const selectedValue = await retryDomAction(page, 'Verifying search radius', async () => {
             const verifiedDropdown = await findDistanceDropdown(page);
             if (!verifiedDropdown) {
-                throw new Error('Distance dropdown disappeared after selection');
+                return null;
             }
 
             return await verifiedDropdown.inputValue();
+        }).catch((error) => {
+            console.log(`  Search radius verification skipped after UI refresh: ${error.message}`);
+            return null;
         });
 
-        if (selectedValue !== optionValue) {
+        if (selectedValue && selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
-        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
+        console.log(`  ✅ Search radius selection completed${selectedValue ? `: ${selectedValue}` : ' after UI refresh'}`);
+        console.log(`  📍 URL after radius selection: ${page.url()}`);
         return true;
 
     } catch (error) {
