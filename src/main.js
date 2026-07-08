@@ -49,7 +49,71 @@ async function retryDomAction(page, description, action, retries = 5) {
 }
 
 async function applyFilters(page, filters, searchRadius) {
-    console.log('🎯 Applying UI filters...');
+    console.log('Applying filters through one canonical search URL...');
+
+    const effectiveFilters = {
+        makes: ['Cadillac', 'Jeep', 'Dodge', 'Ford', 'GMC', 'Chevrolet'],
+        bodyTypes: ['SUV / Crossover', 'Pickup Truck'],
+        minPrice: 35000,
+        maxMileage: 140000,
+        dealRatings: ['GREAT_PRICE', 'GOOD_PRICE'],
+        ...(filters || {}),
+    };
+
+    const bodyTypeGroupIds = [];
+    for (const bodyType of effectiveFilters.bodyTypes || []) {
+        if (bodyType.includes('Pickup')) bodyTypeGroupIds.push('5');
+        if (bodyType.includes('SUV')) bodyTypeGroupIds.push('7');
+    }
+
+    const makeModelTrimPaths = (effectiveFilters.makes || [])
+        .map((make) => MAKE_MODEL_TRIM_PATHS[make.trim().toLowerCase()])
+        .filter(Boolean);
+
+    const url = new URL('https://www.cargurus.ca/search');
+    url.searchParams.set('srpVariation', 'DEFAULT_SEARCH');
+    url.searchParams.set('zip', '20149');
+    url.searchParams.set('sortType', 'DEAL_SCORE');
+    url.searchParams.set('sortDirection', 'ASC');
+    url.searchParams.set('distance', String(searchRadius || 50000));
+    url.searchParams.set('isDeliveryEnabled', 'true');
+
+    if (bodyTypeGroupIds.length > 0) {
+        url.searchParams.set('bodyTypeGroupIds', [...new Set(bodyTypeGroupIds)].sort((a, b) => Number(a) - Number(b)).join(','));
+    }
+
+    if (makeModelTrimPaths.length > 0) {
+        url.searchParams.set('makeModelTrimPaths', [...new Set(makeModelTrimPaths)].join(','));
+        url.searchParams.set('nonShippableBaseline', '1104');
+    }
+
+    if (effectiveFilters.minPrice) {
+        url.searchParams.set('minPrice', String(effectiveFilters.minPrice));
+    }
+
+    if (effectiveFilters.maxMileage) {
+        url.searchParams.set('maxMileage', String(effectiveFilters.maxMileage));
+    }
+
+    if (effectiveFilters.dealRatings?.length > 0) {
+        url.searchParams.set('dealRatings', [...new Set(effectiveFilters.dealRatings)].join(','));
+    }
+
+    console.log(`  Filter URL: ${url.toString()}`);
+    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
+    await waitForFilterUiToSettle(page, 6000);
+
+    const pageTitle = await page.title().catch(() => '');
+    console.log(`  Filtered page title: ${pageTitle}`);
+    console.log(`  Filtered URL after load: ${page.url()}`);
+
+    if (/verification required/i.test(pageTitle)) {
+        console.log('  Verification page detected after loading filtered URL.');
+        return false;
+    }
+
+    console.log('All filters applied successfully through URL.');
+    return true;
 
     // Each step returns true/false — if any fails, stop immediately and return false
     if (!await setSearchRadius(page, searchRadius)) return false;
@@ -775,7 +839,10 @@ await Actor.main(async () => {
 
             // Count available car listings
             const totalListings = await page.evaluate(() => {
-                return document.querySelectorAll('a[data-testid="car-blade-link"]').length;
+                const links = document.querySelectorAll(
+                    'a[data-testid="car-blade-link"], [data-testid="srp-listing-tile"] a[href*="/details/"]'
+                );
+                return links.length;
             });
 
             console.log(`🚗 Found ${totalListings} car listings on page ${pageToScrape}`);
@@ -803,7 +870,9 @@ await Actor.main(async () => {
             try {
                 // Get listing URL from main search tab (which stays open the whole time)
                 const listingHref = await page.evaluate((index) => {
-                    const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
+                    const links = document.querySelectorAll(
+                        'a[data-testid="car-blade-link"], [data-testid="srp-listing-tile"] a[href*="/details/"]'
+                    );
                     return links[index] ? links[index].href : null;
                 }, listingIndex);
 
