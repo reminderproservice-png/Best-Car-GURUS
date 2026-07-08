@@ -81,17 +81,17 @@ async function dumpDebugState(page, tag) {
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
-    // ⚠️ DIAGNOSTIC TOGGLE — set to false to skip the distance/Nationwide step.
-    // Purpose: isolate whether the distance-change page reload is what breaks the
-    // other filters. If body style/make/price/deal all work with this off, the
-    // distance step is confirmed as the culprit. Flip back to true when done.
+    // Distance (Nationwide = 50000) is now applied via the base /search URL, so we no
+    // longer touch the distance dropdown — that dropdown-change was what redirected the
+    // page to the US-zip error state. Leave SET_DISTANCE off unless CarGurus stops
+    // honouring the distance URL param, in which case flip it back on.
     const SET_DISTANCE = false;
 
     // Each step returns true/false — if any fails, stop immediately and return false
     if (SET_DISTANCE) {
         if (!await setSearchRadius(page, searchRadius)) return false;
     } else {
-        console.log('  ⏭️ SKIPPING distance/Nationwide step (diagnostic mode)');
+        console.log('  ⏭️ Distance/Nationwide set via URL — skipping dropdown step');
     }
     if (!await applyBodyTypeFilter(page, filters.bodyTypes)) return false;
     if (filters.makes && filters.makes.length > 0) {
@@ -581,7 +581,15 @@ await Actor.main(async () => {
     console.log(`🌍 Search radius: ${searchRadius === 50000 ? 'Nationwide' : searchRadius + ' km'}`);
     console.log(`📊 Max results per page: ${maxResults}`);
 
-    const baseUrl = 'https://www.cargurus.ca/Cars/l-Used-SUV-Crossover-bg7';
+    // CarGurus now redirects filter changes to /search and takes the location from
+    // the visitor's IP. On Apify (US datacenter) that resolves to US zip 20149, which
+    // on cargurus.CA returns an "Error / 0 results" page and kills the filter sidebar.
+    // Fix: start on /search with an explicit Canadian postal code so the whole session
+    // is pinned to a Canadian location. Every later filter click then stays Canadian.
+    // Change CANADIAN_ZIP to move the search location (e.g. 'M5V 3L9' = Toronto).
+    const CANADIAN_ZIP = 'M5V 3L9';
+    const baseUrl = `https://www.cargurus.ca/search?zip=${encodeURIComponent(CANADIAN_ZIP)}`
+        + `&distance=50000&sortType=DEAL_SCORE&sortDirection=ASC`;
 
     // Launch browser, apply filters — full restart on failure (up to 3 attempts)
     let browser, context, page;
