@@ -81,8 +81,18 @@ async function dumpDebugState(page, tag) {
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
+    // ⚠️ DIAGNOSTIC TOGGLE — set to false to skip the distance/Nationwide step.
+    // Purpose: isolate whether the distance-change page reload is what breaks the
+    // other filters. If body style/make/price/deal all work with this off, the
+    // distance step is confirmed as the culprit. Flip back to true when done.
+    const SET_DISTANCE = false;
+
     // Each step returns true/false — if any fails, stop immediately and return false
-    if (!await setSearchRadius(page, searchRadius)) return false;
+    if (SET_DISTANCE) {
+        if (!await setSearchRadius(page, searchRadius)) return false;
+    } else {
+        console.log('  ⏭️ SKIPPING distance/Nationwide step (diagnostic mode)');
+    }
     if (!await applyBodyTypeFilter(page, filters.bodyTypes)) return false;
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
