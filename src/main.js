@@ -9,90 +9,56 @@ chromium.use(StealthPlugin());
 // FILTER AUTOMATION HELPERS
 // ============================================
 
-function isDetachedOrRefreshingError(error) {
-    const message = error?.message || String(error);
-    return (
-        message.includes('Element is not attached to the DOM') ||
-        message.includes('element was detached from the DOM') ||
-        message.includes('Execution context was destroyed') ||
-        message.includes('Target closed')
-    );
+// CarGurus shows a LIVE count next to every filter option ("SUV / Crossover (10,138)")
+// and recomputes them on every filter change, which remounts the checkbox/accordion
+// nodes. Any Playwright call that waits for element stability (scrollIntoViewIfNeeded,
+// or a held locator) dies with "Element is not attached to the DOM" or times out.
+// These helpers never hold a node across the re-render: they re-query fresh, click
+// natively in-page (no stability wait), and poll the state, tolerating transient nulls.
+
+async function readAttrInPage(page, selector, attr) {
+    return page.evaluate(({ selector, attr }) => {
+        const el = document.querySelector(selector);
+        return el ? el.getAttribute(attr) : null;
+    }, { selector, attr }).catch(() => null);
 }
 
-async function clickFreshLocator(page, selector, description, timeout = 30000) {
-    let lastError;
+async function clickInPage(page, selector) {
+    return page.evaluate((selector) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center', inline: 'center' });
+        el.click();
+        return true;
+    }, selector).catch(() => false);
+}
 
-    for (let attempt = 1; attempt <= 4; attempt++) {
-        const locator = page.locator(selector).first();
+// Click a checkbox/toggle until `attr` reaches `want`, re-finding it fresh each pass so
+// a mid-click remount doesn't fail us. Reads state before clicking so we never toggle
+// an already-correct box back off. Returns true once the desired state is reached.
+async function clickUntilState(page, selector, { attr = 'aria-checked', want = 'true', label = selector, tries = 8 } = {}) {
+    for (let i = 1; i <= tries; i++) {
+        const current = await readAttrInPage(page, selector, attr);
+        if (current === want) return true;
 
-        try {
-            await locator.waitFor({ state: 'attached', timeout });
-            await locator.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
-            await page.waitForTimeout(300);
-            await locator.click({ timeout: 10000, force: true });
-            return true;
-        } catch (error) {
-            lastError = error;
-            console.log(`  ${description} click attempt ${attempt}/4 failed: ${error.message}`);
-
-            if (!isDetachedOrRefreshingError(error) && !error.message.includes('Timeout')) {
-                throw error;
-            }
-
-            await page.waitForTimeout(1000 + attempt * 500);
+        const clicked = await clickInPage(page, selector);
+        if (!clicked) {
+            await page.waitForTimeout(700); // node not mounted yet - let it render, retry
+            continue;
         }
+
+        await page.waitForTimeout(900); // let the live-count re-render settle
+        if (await readAttrInPage(page, selector, attr) === want) return true;
     }
 
-    throw lastError;
-}
-
-async function dumpDebugState(page, tag) {
-    try {
-        const info = await page.evaluate(() => ({
-            url: window.location.href,
-            title: document.title,
-            accordionTriggers: Array.from(
-                document.querySelectorAll('[id*="accordion-trigger"], [data-chassis="accordion-trigger"]')
-            ).map((el) => ({
-                id: el.id,
-                text: (el.textContent || '').trim().slice(0, 60),
-                expanded: el.getAttribute('aria-expanded'),
-            })),
-            hasBodyStyleTrigger: !!document.querySelector('#BodyStyle-accordion-trigger'),
-            distanceSelectCount: document.querySelectorAll('select[aria-label="Distance from me"]').length,
-            bodyPreview: document.body ? document.body.innerText.trim().slice(0, 600) : null,
-        }));
-
-        console.log(`  🧭 [${tag}] url=${info.url}`);
-        console.log(`  🧭 [${tag}] title=${info.title}`);
-        console.log(`  🧭 [${tag}] hasBodyStyleTrigger=${info.hasBodyStyleTrigger} distanceSelects=${info.distanceSelectCount}`);
-        console.log(`  🧭 [${tag}] accordion triggers on page: ${JSON.stringify(info.accordionTriggers)}`);
-        console.log(`  🧭 [${tag}] body text preview: ${info.bodyPreview}`);
-
-        const stamp = Date.now();
-        await Actor.setValue(`debug-${tag}-${stamp}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
-        await Actor.setValue(`debug-${tag}-${stamp}.html`, await page.content(), { contentType: 'text/html' });
-        console.log(`  🧭 [${tag}] saved debug-${tag}-${stamp}.png and .html to key-value store`);
-    } catch (e) {
-        console.log(`  🧭 [${tag}] debug dump failed: ${e.message}`);
-    }
+    console.log(`  ⚠️ ${label}: state never reached ${attr}=${want} after ${tries} tries`);
+    return false;
 }
 
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
-    // Distance (Nationwide = 50000) is now applied via the base /search URL, so we no
-    // longer touch the distance dropdown — that dropdown-change was what redirected the
-    // page to the US-zip error state. Leave SET_DISTANCE off unless CarGurus stops
-    // honouring the distance URL param, in which case flip it back on.
-    const SET_DISTANCE = false;
-
-    // Each step returns true/false — if any fails, stop immediately and return false
-    if (SET_DISTANCE) {
-        if (!await setSearchRadius(page, searchRadius)) return false;
-    } else {
-        console.log('  ⏭️ Distance/Nationwide set via URL — skipping dropdown step');
-    }
+    if (!await setSearchRadius(page, searchRadius)) return false;
     if (!await applyBodyTypeFilter(page, filters.bodyTypes)) return false;
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
@@ -105,35 +71,25 @@ async function applyFilters(page, filters, searchRadius) {
 }
 
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    for (let attempt = 1; attempt <= 4; attempt++) {
-        const trigger = page.locator(triggerSelector).first();
-        const content = page.locator(contentSelector).first();
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
-        const contentVisible = await content.isVisible().catch(() => false);
+    // Wait for the trigger to exist at all (fresh locator, don't hold it).
+    await page.locator(triggerSelector).first().waitFor({ state: 'attached', timeout: 30000 });
 
-        if (triggerExpanded === 'true' || contentState === 'open' || contentVisible) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        const triggerExpanded = await readAttrInPage(page, triggerSelector, 'aria-expanded');
+        const contentState = await readAttrInPage(page, contentSelector, 'data-state');
+
+        if (triggerExpanded === 'true' || contentState === 'open') {
             console.log(`  ✅ ${name} accordion is open`);
             return true;
         }
 
-        try {
-            await clickFreshLocator(page, triggerSelector, `${name} accordion`, 90000);
-        } catch (error) {
-            if (attempt === 4) throw error;
-            await page.waitForTimeout(1200);
-            continue;
-        }
+        await clickInPage(page, triggerSelector); // native click, no stability wait
+        await page.waitForTimeout(900);
 
-        await page.waitForTimeout(1200);
+        const updatedExpanded = await readAttrInPage(page, triggerSelector, 'aria-expanded');
+        const updatedContentState = await readAttrInPage(page, contentSelector, 'data-state');
 
-        const updatedTrigger = page.locator(triggerSelector).first();
-        const updatedContent = page.locator(contentSelector).first();
-        const updatedExpanded = await updatedTrigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await updatedContent.getAttribute('data-state').catch(() => null);
-        const updatedContentVisible = await updatedContent.isVisible().catch(() => false);
-
-        if (updatedExpanded === 'true' || updatedContentState === 'open' || updatedContentVisible) {
+        if (updatedExpanded === 'true' || updatedContentState === 'open') {
             console.log(`  ✅ Opened ${name} accordion`);
             return true;
         }
@@ -226,31 +182,16 @@ async function setSearchRadius(page, searchRadius) {
             console.log(`  🌍 Nationwide option resolved to value: ${optionValue}`);
         }
 
-        const freshDropdown = await findDistanceDropdown(page);
-        if (!freshDropdown) {
-            throw new Error('Distance dropdown disappeared before selection');
-        }
-
-        await freshDropdown.selectOption(optionValue, { timeout: 90000 });
-
-        // Changing distance now reloads/re-renders the SRP. Let it settle before we
-        // verify or move on, otherwise the select (and sidebar) are detached mid-reload.
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+        await dropdown.selectOption(optionValue, { timeout: 90000 });
         await page.waitForTimeout(2000);
 
-        const selectedValue = await findDistanceDropdown(page)
-            .then((verifiedDropdown) => verifiedDropdown ? verifiedDropdown.inputValue({ timeout: 5000 }) : null)
-            .catch((error) => {
-                console.log(`  Distance verification skipped after UI refresh: ${error.message}`);
-                return null;
-            });
+        const selectedValue = await dropdown.inputValue();
 
-        if (selectedValue && selectedValue !== optionValue) {
+        if (selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
-        console.log(`  ✅ Search radius selection completed${selectedValue ? `: ${selectedValue}` : ' after UI refresh'}`);
+        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
         return true;
 
     } catch (error) {
@@ -272,44 +213,21 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
-        // The distance change reloads the SRP. Wait for the filter sidebar to come
-        // back before touching any accordion, instead of racing into a mid-reload page.
-        const sidebarBack = await page.locator('#BodyStyle-accordion-trigger')
-            .first()
-            .waitFor({ state: 'attached', timeout: 45000 })
-            .then(() => true)
-            .catch(() => false);
-
-        if (!sidebarBack) {
-            console.log('  ⚠️ Body Style trigger not present after distance change — dumping page state');
-            await dumpDebugState(page, 'sidebar-missing');
-        }
-
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            // aria-label carries the live count ("SUV / Crossover (10,138)"), so match by
+            // substring. Click natively and poll - the node remounts on every count change.
+            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
-            await page.waitForTimeout(300);
+            await page.locator(selector).first().waitFor({ state: 'attached', timeout: 30000 });
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
-                return true;
+            const ok = await clickUntilState(page, selector, { want: 'true', label: `${groupName}: ${labelText}` });
+            if (!ok) {
+                throw new Error(`${groupName}: could not check ${labelText} (list kept re-rendering)`);
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(1200);
-
-            const freshCheckbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
-            const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
-
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
+            console.log(`  ✅ ${groupName}: ${labelText} selected`);
             return true;
         };
 
@@ -327,7 +245,6 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         return true;
     } catch (error) {
         console.log(`  ❌ Body type filter failed: ${error.message}`);
-        await dumpDebugState(page, 'bodystyle-fail');
         return false;
     }
 }
@@ -353,46 +270,25 @@ function normalizeMakeName(make) {
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
-    const selectors = [
-        `button[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[role="checkbox"][aria-label="${make}"]`,
-        `button[role="checkbox"][aria-label="${normalizedMake}"]`,
-        `label:has-text("${make}")`,
-        `label:has-text("${normalizedMake}")`,
-    ];
+    // The make button carries both id and data-testid on the same node (verified in the
+    // live DOM), e.g. id="FILTER.MAKE_MODEL.Ford". Use it as a single stable target and
+    // poll aria-checked - the make list remounts on every count change just like body type.
+    const selector = `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
 
-    for (const selector of selectors) {
-        const locator = page.locator(selector).first();
+    const present = await page.locator(selector).first()
+        .waitFor({ state: 'attached', timeout: 8000 })
+        .then(() => true)
+        .catch(() => false);
 
-        try {
-            await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-            await page.waitForTimeout(300);
+    if (!present) {
+        console.log(`  ⚠️ ${make}: checkbox not found (selector ${selector})`);
+        return false;
+    }
 
-            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${make} already selected`);
-                return true;
-            }
-
-            await locator.click({ timeout: 10000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedAfter === 'true') {
-                console.log(`  ✅ Added ${make} using selector: ${selector}`);
-                return true;
-            }
-
-            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
-        } catch (_) {
-            // Try next selector
-        }
+    const ok = await clickUntilState(page, selector, { want: 'true', label: make });
+    if (ok) {
+        console.log(`  ✅ Added ${make}`);
+        return true;
     }
 
     return false;
@@ -431,7 +327,7 @@ async function applyMakeFilter(page, makes) {
                 });
 
                 console.log(`  🔎 Available makes: ${JSON.stringify(availableMakes)}`);
-                return false; // Stop immediately, don't burn 90s on every remaining make
+                return false;
             }
 
             await page.waitForTimeout(800);
@@ -452,11 +348,14 @@ async function applyPriceFilter(page) {
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
         // Find the MINIMUM slider specifically (not maximum)
-        const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
-        await minSlider.waitFor({ state: 'visible', timeout: 90000 });
+        const sliderSel = '[role="slider"][aria-label="Minimum"]';
+        await page.locator(sliderSel).first().waitFor({ state: 'attached', timeout: 30000 });
 
-        // Click on the minimum slider to focus it
-        await minSlider.click({ timeout: 90000 });
+        // Focus the slider in-page (native - no stability wait) so keyboard input drives it
+        await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if (el) { el.scrollIntoView({ block: 'center' }); el.focus(); el.click(); }
+        }, sliderSel);
         await page.waitForTimeout(500);
 
         // Set the slider value to 24 (which equals $35,000 CAD)
@@ -486,17 +385,27 @@ async function applyDealRatingFilter(page, dealRatings) {
 
         await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
-        // Click checkboxes for each deal rating
+        // Click checkboxes for each deal rating - native click + poll, same remount issue.
         for (const rating of dealRatings) {
-            try {
-                // Click with 6-minute timeout
-                await page.click(`#FILTER\\.DEAL_RATING\\.${rating}`, { timeout: 90000 });
-                console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
-                await page.waitForTimeout(300);
-            } catch (error) {
-                console.log(`  ❌ Could not click ${rating}: ${error.message}`);
+            const selector = `[id="FILTER.DEAL_RATING.${rating}"]`;
+
+            const present = await page.locator(selector).first()
+                .waitFor({ state: 'attached', timeout: 30000 })
+                .then(() => true)
+                .catch(() => false);
+
+            if (!present) {
+                console.log(`  ❌ Could not find ${rating} checkbox`);
                 return false;
             }
+
+            const ok = await clickUntilState(page, selector, { want: 'true', label: rating.replace('_', ' ') });
+            if (!ok) {
+                console.log(`  ❌ Could not check ${rating}`);
+                return false;
+            }
+
+            console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
         }
 
         await page.waitForTimeout(2000); // Wait for results to update
@@ -529,6 +438,35 @@ await Actor.main(async () => {
     } = input;
 
     console.log('🚀 Starting CarGurus Stealth Scraper with UI Filters...');
+
+    // Wire the Apify proxy from the input into Playwright. WITHOUT this, the browser
+    // uses Apify's raw US datacenter IP - CarGurus then geolocates the /search route to
+    // US zip 20149 and returns an "Error / 0 results" page on cargurus.ca, which kills
+    // every filter. The Canadian RESIDENTIAL proxy makes the IP Canadian so location
+    // resolves correctly. (Passing proxyConfiguration in the input alone does nothing.)
+    let launchProxy;
+    const inputProxy = input.proxyConfiguration;
+    if (inputProxy && inputProxy.useApifyProxy !== false) {
+        const proxyConfiguration = await Actor.createProxyConfiguration({
+            groups: inputProxy.apifyProxyGroups,
+            countryCode: inputProxy.apifyProxyCountry,
+        });
+
+        if (proxyConfiguration) {
+            const proxyUrl = await proxyConfiguration.newUrl();
+            const parsed = new URL(proxyUrl);
+            launchProxy = {
+                server: `${parsed.protocol}//${parsed.host}`,
+                username: decodeURIComponent(parsed.username),
+                password: decodeURIComponent(parsed.password),
+            };
+            console.log(`🌐 Proxy active: ${parsed.host} | groups=${inputProxy.apifyProxyGroups?.join(',') || 'auto'} | country=${inputProxy.apifyProxyCountry || 'auto'}`);
+        }
+    }
+
+    if (!launchProxy) {
+        console.log('⚠️ No proxy in use - browser will use the datacenter IP (CarGurus may geolocate to the US and return 0 results).');
+    }
 
     // Open persistent Key-Value Store (survives between runs)
     const kv = await Actor.openKeyValueStore('scraper-state');
@@ -581,17 +519,9 @@ await Actor.main(async () => {
     console.log(`🌍 Search radius: ${searchRadius === 50000 ? 'Nationwide' : searchRadius + ' km'}`);
     console.log(`📊 Max results per page: ${maxResults}`);
 
-    // CarGurus now redirects filter changes to /search and takes the location from
-    // the visitor's IP. On Apify (US datacenter) that resolves to US zip 20149, which
-    // on cargurus.CA returns an "Error / 0 results" page and kills the filter sidebar.
-    // Fix: start on /search with an explicit Canadian postal code so the whole session
-    // is pinned to a Canadian location. Every later filter click then stays Canadian.
-    // Change CANADIAN_ZIP to move the search location (e.g. 'M5V 3L9' = Toronto).
-    const CANADIAN_ZIP = 'M5V 3L9';
-    const baseUrl = `https://www.cargurus.ca/search?zip=${encodeURIComponent(CANADIAN_ZIP)}`
-        + `&distance=50000&sortType=DEAL_SCORE&sortDirection=ASC`;
+    const baseUrl = 'https://www.cargurus.ca/Cars/l-Used-SUV-Crossover-bg7';
 
-    // Launch browser, apply filters — full restart on failure (up to 3 attempts)
+    // Launch browser, apply filters - full browser restart on failure (up to 3 attempts)
     let browser, context, page;
     let filtersSucceeded = false;
 
@@ -605,6 +535,7 @@ await Actor.main(async () => {
 
         browser = await chromium.launch({
             headless: true,
+            proxy: launchProxy, // Canadian residential proxy from input (undefined = direct)
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process',
