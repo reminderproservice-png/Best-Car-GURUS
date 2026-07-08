@@ -57,7 +57,7 @@ async function applyFilters(page, filters, searchRadius) {
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
     }
-    if (!await applyPriceFilter(page)) return false;
+    if (!await applyPriceAndMileageFilter(page, filters.minPrice, filters.maxMileage)) return false;
     if (!await applyDealRatingFilter(page, filters.dealRatings)) return false;
 
     console.log('✅ All filters applied successfully!');
@@ -453,8 +453,24 @@ async function applyMakeFilter(page, makes) {
     }
 }
 
-async function applyPriceFilter(page) {
+async function applyPriceAndMileageFilter(page, minPrice, maxMileage) {
     try {
+        console.log(`Setting price/mileage filters: minPrice=${minPrice}, maxMileage=${maxMileage}`);
+
+        const url = new URL(page.url());
+        if (minPrice) {
+            url.searchParams.set('minPrice', String(minPrice));
+        }
+        if (maxMileage) {
+            url.searchParams.set('maxMileage', String(maxMileage));
+        }
+
+        console.log(`  Applying price/mileage through URL params: minPrice=${url.searchParams.get('minPrice')}, maxMileage=${url.searchParams.get('maxMileage')}`);
+        await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
+        await waitForFilterUiToSettle(page, 3000);
+        console.log(`  Price/mileage URL applied: ${page.url()}`);
+        return true;
+
         console.log(`💰 Setting minimum price to: $35,000 CAD`);
 
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
