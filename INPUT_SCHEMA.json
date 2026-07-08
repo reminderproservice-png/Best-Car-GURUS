@@ -39,11 +39,11 @@
       "description": "Filters to apply via UI automation",
       "editor": "json",
       "default": {
-        "makes": ["Cadillac", "Jeep", "Dodge", "Ford", "GMC", "Chevrolet"],
+        "makes": ["Ford", "GMC", "Chevrolet", "Cadillac"],
         "bodyTypes": ["SUV / Crossover", "Pickup Truck"],
         "maxMileage": 140000,
         "minPrice": 35000,
-        "dealRatings": ["GREAT_PRICE", "GOOD_PRICE"]
+        "dealRatings": ["GREAT_PRICE", "GOOD_PRICE", "FAIR_PRICE"]
       }
     },
     "proxyConfiguration": {

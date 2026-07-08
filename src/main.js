@@ -9,39 +9,37 @@ chromium.use(StealthPlugin());
 // FILTER AUTOMATION HELPERS
 // ============================================
 
-const DOM_RETRY_ERRORS = [
-    'Element is not attached to the DOM',
-    'element was detached from the DOM',
-    'Distance dropdown disappeared',
-    'Target closed',
-    'Execution context was destroyed',
-];
-
-function isRetryableDomError(error) {
+function isDetachedOrRefreshingError(error) {
     const message = error?.message || String(error);
-    return DOM_RETRY_ERRORS.some((text) => message.includes(text));
+    return (
+        message.includes('Element is not attached to the DOM') ||
+        message.includes('element was detached from the DOM') ||
+        message.includes('Execution context was destroyed') ||
+        message.includes('Target closed')
+    );
 }
 
-async function waitForFilterUiToSettle(page, timeout = 1500) {
-    await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await page.waitForTimeout(timeout);
-}
-
-async function retryDomAction(page, description, action, retries = 5) {
+async function clickFreshLocator(page, selector, description, timeout = 30000) {
     let lastError;
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        const locator = page.locator(selector).first();
+
         try {
-            return await action(attempt);
+            await locator.waitFor({ state: 'attached', timeout });
+            await locator.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
+            await page.waitForTimeout(300);
+            await locator.click({ timeout: 10000, force: true });
+            return true;
         } catch (error) {
             lastError = error;
+            console.log(`  ${description} click attempt ${attempt}/4 failed: ${error.message}`);
 
-            if (!isRetryableDomError(error) && attempt >= 2) {
+            if (!isDetachedOrRefreshingError(error) && !error.message.includes('Timeout')) {
                 throw error;
             }
 
-            console.log(`  ⚠️ ${description} retry ${attempt}/${retries}: ${error.message}`);
-            await waitForFilterUiToSettle(page, 1000 + attempt * 500);
+            await page.waitForTimeout(1000 + attempt * 500);
         }
     }
 
@@ -49,71 +47,7 @@ async function retryDomAction(page, description, action, retries = 5) {
 }
 
 async function applyFilters(page, filters, searchRadius) {
-    console.log('Applying filters through one canonical search URL...');
-
-    const effectiveFilters = {
-        makes: ['Cadillac', 'Jeep', 'Dodge', 'Ford', 'GMC', 'Chevrolet'],
-        bodyTypes: ['SUV / Crossover', 'Pickup Truck'],
-        minPrice: 35000,
-        maxMileage: 140000,
-        dealRatings: ['GREAT_PRICE', 'GOOD_PRICE'],
-        ...(filters || {}),
-    };
-
-    const bodyTypeGroupIds = [];
-    for (const bodyType of effectiveFilters.bodyTypes || []) {
-        if (bodyType.includes('Pickup')) bodyTypeGroupIds.push('5');
-        if (bodyType.includes('SUV')) bodyTypeGroupIds.push('7');
-    }
-
-    const makeModelTrimPaths = (effectiveFilters.makes || [])
-        .map((make) => MAKE_MODEL_TRIM_PATHS[make.trim().toLowerCase()])
-        .filter(Boolean);
-
-    const url = new URL('https://www.cargurus.ca/search');
-    url.searchParams.set('srpVariation', 'DEFAULT_SEARCH');
-    url.searchParams.set('zip', '20149');
-    url.searchParams.set('sortType', 'DEAL_SCORE');
-    url.searchParams.set('sortDirection', 'ASC');
-    url.searchParams.set('distance', String(searchRadius || 50000));
-    url.searchParams.set('isDeliveryEnabled', 'true');
-
-    if (bodyTypeGroupIds.length > 0) {
-        url.searchParams.set('bodyTypeGroupIds', [...new Set(bodyTypeGroupIds)].sort((a, b) => Number(a) - Number(b)).join(','));
-    }
-
-    if (makeModelTrimPaths.length > 0) {
-        url.searchParams.set('makeModelTrimPaths', [...new Set(makeModelTrimPaths)].join(','));
-        url.searchParams.set('nonShippableBaseline', '1104');
-    }
-
-    if (effectiveFilters.minPrice) {
-        url.searchParams.set('minPrice', String(effectiveFilters.minPrice));
-    }
-
-    if (effectiveFilters.maxMileage) {
-        url.searchParams.set('maxMileage', String(effectiveFilters.maxMileage));
-    }
-
-    if (effectiveFilters.dealRatings?.length > 0) {
-        url.searchParams.set('dealRatings', [...new Set(effectiveFilters.dealRatings)].join(','));
-    }
-
-    console.log(`  Filter URL: ${url.toString()}`);
-    await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
-    await waitForFilterUiToSettle(page, 6000);
-
-    const pageTitle = await page.title().catch(() => '');
-    console.log(`  Filtered page title: ${pageTitle}`);
-    console.log(`  Filtered URL after load: ${page.url()}`);
-
-    if (/verification required/i.test(pageTitle)) {
-        console.log('  Verification page detected after loading filtered URL.');
-        return false;
-    }
-
-    console.log('All filters applied successfully through URL.');
-    return true;
+    console.log('🎯 Applying UI filters...');
 
     // Each step returns true/false — if any fails, stop immediately and return false
     if (!await setSearchRadius(page, searchRadius)) return false;
@@ -121,7 +55,7 @@ async function applyFilters(page, filters, searchRadius) {
     if (filters.makes && filters.makes.length > 0) {
         if (!await applyMakeFilter(page, filters.makes)) return false;
     }
-    if (!await applyPriceAndMileageFilter(page, filters.minPrice, filters.maxMileage)) return false;
+    if (!await applyPriceFilter(page)) return false;
     if (!await applyDealRatingFilter(page, filters.dealRatings)) return false;
 
     console.log('✅ All filters applied successfully!');
@@ -129,36 +63,35 @@ async function applyFilters(page, filters, searchRadius) {
 }
 
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    for (let attempt = 1; attempt <= 4; attempt++) {
         const trigger = page.locator(triggerSelector).first();
         const content = page.locator(contentSelector).first();
-
-        await trigger.waitFor({ state: 'visible', timeout: 90000 });
         const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
         const contentState = await content.getAttribute('data-state').catch(() => null);
+        const contentVisible = await content.isVisible().catch(() => false);
 
-        if (triggerExpanded === 'true' || contentState === 'open') {
+        if (triggerExpanded === 'true' || contentState === 'open' || contentVisible) {
             console.log(`  ✅ ${name} accordion is open`);
             return true;
         }
 
         try {
-            await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-            await trigger.click({ timeout: 15000, force: true });
-            await waitForFilterUiToSettle(page, 800);
+            await clickFreshLocator(page, triggerSelector, `${name} accordion`, 90000);
         } catch (error) {
-            if (!isRetryableDomError(error)) throw error;
-            console.log(`  Accordion changed while clicking ${name}; retrying...`);
-            await waitForFilterUiToSettle(page, 1200);
+            if (attempt === 4) throw error;
+            await page.waitForTimeout(1200);
             continue;
         }
+
+        await page.waitForTimeout(1200);
 
         const updatedTrigger = page.locator(triggerSelector).first();
         const updatedContent = page.locator(contentSelector).first();
         const updatedExpanded = await updatedTrigger.getAttribute('aria-expanded').catch(() => null);
         const updatedContentState = await updatedContent.getAttribute('data-state').catch(() => null);
+        const updatedContentVisible = await updatedContent.isVisible().catch(() => false);
 
-        if (updatedExpanded === 'true' || updatedContentState === 'open') {
+        if (updatedExpanded === 'true' || updatedContentState === 'open' || updatedContentVisible) {
             console.log(`  ✅ Opened ${name} accordion`);
             return true;
         }
@@ -251,35 +184,26 @@ async function setSearchRadius(page, searchRadius) {
             console.log(`  🌍 Nationwide option resolved to value: ${optionValue}`);
         }
 
-        await retryDomAction(page, 'Selecting search radius', async () => {
-            const freshDropdown = await findDistanceDropdown(page);
-            if (!freshDropdown) {
-                throw new Error('Distance dropdown disappeared before selection');
-            }
+        const freshDropdown = await findDistanceDropdown(page);
+        if (!freshDropdown) {
+            throw new Error('Distance dropdown disappeared before selection');
+        }
 
-            await freshDropdown.selectOption(optionValue, { timeout: 90000 });
-            await waitForFilterUiToSettle(page, 2500);
-            return true;
-        });
+        await freshDropdown.selectOption(optionValue, { timeout: 90000 });
+        await page.waitForTimeout(2000);
 
-        const selectedValue = await retryDomAction(page, 'Verifying search radius', async () => {
-            const verifiedDropdown = await findDistanceDropdown(page);
-            if (!verifiedDropdown) {
+        const selectedValue = await findDistanceDropdown(page)
+            .then((verifiedDropdown) => verifiedDropdown ? verifiedDropdown.inputValue({ timeout: 5000 }) : null)
+            .catch((error) => {
+                console.log(`  Distance verification skipped after UI refresh: ${error.message}`);
                 return null;
-            }
-
-            return await verifiedDropdown.inputValue();
-        }).catch((error) => {
-            console.log(`  Search radius verification skipped after UI refresh: ${error.message}`);
-            return null;
-        });
+            });
 
         if (selectedValue && selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
         console.log(`  ✅ Search radius selection completed${selectedValue ? `: ${selectedValue}` : ' after UI refresh'}`);
-        console.log(`  📍 URL after radius selection: ${page.url()}`);
         return true;
 
     } catch (error) {
@@ -301,60 +225,35 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
-        const bodyTypeGroupIds = [];
-        for (const bodyType of bodyTypes) {
-            if (bodyType.includes('SUV')) bodyTypeGroupIds.push('7');
-            if (bodyType.includes('Pickup')) bodyTypeGroupIds.push('5');
-        }
-
-        if (bodyTypeGroupIds.length > 0) {
-            const url = new URL(page.url());
-            url.searchParams.delete('bodyTypeGroupIds');
-            url.searchParams.set('bodyTypeGroupIds', [...new Set(bodyTypeGroupIds)].sort((a, b) => Number(a) - Number(b)).join(','));
-
-            console.log(`  Applying body types through URL params: ${url.searchParams.get('bodyTypeGroupIds')}`);
-            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
-            await waitForFilterUiToSettle(page, 3000);
-            console.log(`  Body type URL applied: ${page.url()}`);
-            return true;
-        }
-
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            await retryDomAction(page, `${groupName}: selecting ${labelText}`, async () => {
-                const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
 
-                await checkbox.waitFor({ state: 'visible', timeout: 90000 });
-                await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
+            await checkbox.evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'center' }));
+            await page.waitForTimeout(300);
 
-                const checkedBefore = await checkbox.getAttribute('aria-checked');
-                if (checkedBefore === 'true') {
-                    return true;
-                }
-
-                await checkbox.click({ timeout: 30000, force: true });
-                await waitForFilterUiToSettle(page, 1200);
-
-                const freshCheckbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
-                await freshCheckbox.waitFor({ state: 'visible', timeout: 30000 });
-                const checkedAfter = await freshCheckbox.getAttribute('aria-checked');
-                if (checkedAfter !== 'true') {
-                    throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-                }
-
+            const checkedBefore = await checkbox.getAttribute('aria-checked');
+            if (checkedBefore === 'true') {
+                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
                 return true;
-            });
+            }
+
+            await checkbox.click({ timeout: 30000, force: true });
+            await page.waitForTimeout(1200);
+
+            const freshCheckbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
+            if (checkedAfter !== 'true') {
+                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+            }
 
             console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            await waitForFilterUiToSettle(page, 1000);
-            await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
             return true;
         };
 
         for (const bodyType of bodyTypes) {
-            await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
-
             if (bodyType.includes('SUV')) {
                 await clickCheckboxByAriaLabelContains('Body type', 'SUV / Crossover');
             }
@@ -390,15 +289,6 @@ function normalizeMakeName(make) {
     return map[key] || make.trim().replace(/\s+/g, '_');
 }
 
-const MAKE_MODEL_TRIM_PATHS = {
-    cadillac: 'm22',
-    jeep: 'm32',
-    dodge: 'm24',
-    ford: 'm2',
-    gmc: 'm26',
-    chevrolet: 'm1',
-};
-
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
@@ -413,39 +303,32 @@ async function clickMakeCheckbox(page, make) {
     ];
 
     for (const selector of selectors) {
+        const locator = page.locator(selector).first();
+
         try {
-            const clicked = await retryDomAction(page, `Selecting make ${make}`, async () => {
-                const locator = page.locator(selector).first();
+            await locator.waitFor({ state: 'attached', timeout: 3000 });
+            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+            await page.waitForTimeout(300);
 
-                await locator.waitFor({ state: 'visible', timeout: 3000 });
-                await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-                await page.waitForTimeout(300);
+            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
+            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
 
-                const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-                const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
+            if (checkedBefore === 'true') {
+                console.log(`  ✅ ${make} already selected`);
+                return true;
+            }
 
-                if (checkedBefore === 'true') {
-                    return true;
-                }
+            await locator.click({ timeout: 10000, force: true });
+            await page.waitForTimeout(700);
 
-                await locator.click({ timeout: 10000, force: true });
-                await waitForFilterUiToSettle(page, 1200);
+            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
 
-                const freshCheckbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-                const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
-
-                if (checkedAfter === 'true') {
-                    return true;
-                }
-
-                console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
-                return false;
-            }, 3);
-
-            if (clicked) {
+            if (checkedAfter === 'true') {
                 console.log(`  ✅ Added ${make} using selector: ${selector}`);
                 return true;
             }
+
+            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
         } catch (_) {
             // Try next selector
         }
@@ -457,22 +340,6 @@ async function clickMakeCheckbox(page, make) {
 async function applyMakeFilter(page, makes) {
     try {
         console.log(`🏭 Setting makes: ${makes.join(', ')}`);
-
-        const makeModelTrimPaths = makes
-            .map((make) => MAKE_MODEL_TRIM_PATHS[make.trim().toLowerCase()])
-            .filter(Boolean);
-
-        if (makeModelTrimPaths.length > 0) {
-            const url = new URL(page.url());
-            url.searchParams.set('makeModelTrimPaths', [...new Set(makeModelTrimPaths)].join(','));
-            url.searchParams.set('nonShippableBaseline', '1104');
-
-            console.log(`  Applying makes through URL params: ${url.searchParams.get('makeModelTrimPaths')}`);
-            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
-            await waitForFilterUiToSettle(page, 3000);
-            console.log(`  Make URL applied: ${page.url()}`);
-            return true;
-        }
 
         await ensureAccordionOpen(page, '#MakeAndModel-accordion-trigger', '#MakeAndModel-accordion-content', 'Make & Model');
 
@@ -517,34 +384,18 @@ async function applyMakeFilter(page, makes) {
     }
 }
 
-async function applyPriceAndMileageFilter(page, minPrice, maxMileage) {
+async function applyPriceFilter(page) {
     try {
-        console.log(`Setting price/mileage filters: minPrice=${minPrice}, maxMileage=${maxMileage}`);
-
-        const url = new URL(page.url());
-        if (minPrice) {
-            url.searchParams.set('minPrice', String(minPrice));
-        }
-        if (maxMileage) {
-            url.searchParams.set('maxMileage', String(maxMileage));
-        }
-
-        console.log(`  Applying price/mileage through URL params: minPrice=${url.searchParams.get('minPrice')}, maxMileage=${url.searchParams.get('maxMileage')}`);
-        await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
-        await waitForFilterUiToSettle(page, 3000);
-        console.log(`  Price/mileage URL applied: ${page.url()}`);
-        return true;
-
         console.log(`💰 Setting minimum price to: $35,000 CAD`);
 
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
-        await retryDomAction(page, 'Focusing minimum price slider', async () => {
-            const minSlider = page.locator('[role="slider"][aria-label="Minimum"]').first();
-            await minSlider.waitFor({ state: 'visible', timeout: 90000 });
-            await minSlider.click({ timeout: 30000, force: true });
-            return true;
-        });
+        // Find the MINIMUM slider specifically (not maximum)
+        const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
+        await minSlider.waitFor({ state: 'visible', timeout: 90000 });
+
+        // Click on the minimum slider to focus it
+        await minSlider.click({ timeout: 90000 });
         await page.waitForTimeout(500);
 
         // Set the slider value to 24 (which equals $35,000 CAD)
@@ -572,40 +423,13 @@ async function applyDealRatingFilter(page, dealRatings) {
     try {
         console.log(`⭐ Setting deal ratings: ${dealRatings.join(', ')}`);
 
-        if (dealRatings && dealRatings.length > 0) {
-            const url = new URL(page.url());
-            url.searchParams.set('dealRatings', [...new Set(dealRatings)].join(','));
-
-            console.log(`  Applying deal ratings through URL params: ${url.searchParams.get('dealRatings')}`);
-            await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: 90000 });
-            await waitForFilterUiToSettle(page, 3000);
-            console.log(`  Deal rating URL applied: ${page.url()}`);
-            return true;
-        }
-
         await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
         // Click checkboxes for each deal rating
         for (const rating of dealRatings) {
             try {
-                await retryDomAction(page, `Selecting deal rating ${rating}`, async () => {
-                    const checkbox = page.locator(`#FILTER\\.DEAL_RATING\\.${rating}`).first();
-                    await checkbox.waitFor({ state: 'visible', timeout: 90000 });
-
-                    const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
-                    if (checkedBefore === 'true') return true;
-
-                    await checkbox.click({ timeout: 30000, force: true });
-                    await waitForFilterUiToSettle(page, 800);
-
-                    const freshCheckbox = page.locator(`#FILTER\\.DEAL_RATING\\.${rating}`).first();
-                    const checkedAfter = await freshCheckbox.getAttribute('aria-checked').catch(() => null);
-                    if (checkedAfter !== 'true') {
-                        throw new Error(`clicked ${rating}, but aria-checked is ${checkedAfter}`);
-                    }
-
-                    return true;
-                });
+                // Click with 6-minute timeout
+                await page.click(`#FILTER\\.DEAL_RATING\\.${rating}`, { timeout: 90000 });
                 console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
                 await page.waitForTimeout(300);
             } catch (error) {
@@ -635,11 +459,11 @@ await Actor.main(async () => {
         maxPages = 73,
         maxResults = 24,
         filters = {
-            makes: ['Cadillac', 'Jeep', 'Dodge', 'Ford', 'GMC', 'Chevrolet'],
+            makes: ['Ford', 'GMC', 'Chevrolet', 'Cadillac'],
             bodyTypes: ['SUV / Crossover', 'Pickup Truck'],
             maxMileage: 140000,
             minPrice: 35000,
-            dealRatings: ['GREAT_PRICE', 'GOOD_PRICE']
+            dealRatings: ['GREAT_PRICE', 'GOOD_PRICE', 'FAIR_PRICE']
         }
     } = input;
 
@@ -839,10 +663,7 @@ await Actor.main(async () => {
 
             // Count available car listings
             const totalListings = await page.evaluate(() => {
-                const links = document.querySelectorAll(
-                    'a[data-testid="car-blade-link"], [data-testid="srp-listing-tile"] a[href*="/details/"]'
-                );
-                return links.length;
+                return document.querySelectorAll('a[data-testid="car-blade-link"]').length;
             });
 
             console.log(`🚗 Found ${totalListings} car listings on page ${pageToScrape}`);
@@ -870,9 +691,7 @@ await Actor.main(async () => {
             try {
                 // Get listing URL from main search tab (which stays open the whole time)
                 const listingHref = await page.evaluate((index) => {
-                    const links = document.querySelectorAll(
-                        'a[data-testid="car-blade-link"], [data-testid="srp-listing-tile"] a[href*="/details/"]'
-                    );
+                    const links = document.querySelectorAll('a[data-testid="car-blade-link"]');
                     return links[index] ? links[index].href : null;
                 }, listingIndex);
 
