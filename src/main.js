@@ -46,6 +46,38 @@ async function clickFreshLocator(page, selector, description, timeout = 30000) {
     throw lastError;
 }
 
+async function dumpDebugState(page, tag) {
+    try {
+        const info = await page.evaluate(() => ({
+            url: window.location.href,
+            title: document.title,
+            accordionTriggers: Array.from(
+                document.querySelectorAll('[id*="accordion-trigger"], [data-chassis="accordion-trigger"]')
+            ).map((el) => ({
+                id: el.id,
+                text: (el.textContent || '').trim().slice(0, 60),
+                expanded: el.getAttribute('aria-expanded'),
+            })),
+            hasBodyStyleTrigger: !!document.querySelector('#BodyStyle-accordion-trigger'),
+            distanceSelectCount: document.querySelectorAll('select[aria-label="Distance from me"]').length,
+            bodyPreview: document.body ? document.body.innerText.trim().slice(0, 600) : null,
+        }));
+
+        console.log(`  🧭 [${tag}] url=${info.url}`);
+        console.log(`  🧭 [${tag}] title=${info.title}`);
+        console.log(`  🧭 [${tag}] hasBodyStyleTrigger=${info.hasBodyStyleTrigger} distanceSelects=${info.distanceSelectCount}`);
+        console.log(`  🧭 [${tag}] accordion triggers on page: ${JSON.stringify(info.accordionTriggers)}`);
+        console.log(`  🧭 [${tag}] body text preview: ${info.bodyPreview}`);
+
+        const stamp = Date.now();
+        await Actor.setValue(`debug-${tag}-${stamp}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+        await Actor.setValue(`debug-${tag}-${stamp}.html`, await page.content(), { contentType: 'text/html' });
+        console.log(`  🧭 [${tag}] saved debug-${tag}-${stamp}.png and .html to key-value store`);
+    } catch (e) {
+        console.log(`  🧭 [${tag}] debug dump failed: ${e.message}`);
+    }
+}
+
 async function applyFilters(page, filters, searchRadius) {
     console.log('🎯 Applying UI filters...');
 
@@ -190,6 +222,11 @@ async function setSearchRadius(page, searchRadius) {
         }
 
         await freshDropdown.selectOption(optionValue, { timeout: 90000 });
+
+        // Changing distance now reloads/re-renders the SRP. Let it settle before we
+        // verify or move on, otherwise the select (and sidebar) are detached mid-reload.
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
         await page.waitForTimeout(2000);
 
         const selectedValue = await findDistanceDropdown(page)
@@ -224,6 +261,19 @@ async function setSearchRadius(page, searchRadius) {
 async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
+
+        // The distance change reloads the SRP. Wait for the filter sidebar to come
+        // back before touching any accordion, instead of racing into a mid-reload page.
+        const sidebarBack = await page.locator('#BodyStyle-accordion-trigger')
+            .first()
+            .waitFor({ state: 'attached', timeout: 45000 })
+            .then(() => true)
+            .catch(() => false);
+
+        if (!sidebarBack) {
+            console.log('  ⚠️ Body Style trigger not present after distance change — dumping page state');
+            await dumpDebugState(page, 'sidebar-missing');
+        }
 
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
@@ -267,6 +317,7 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         return true;
     } catch (error) {
         console.log(`  ❌ Body type filter failed: ${error.message}`);
+        await dumpDebugState(page, 'bodystyle-fail');
         return false;
     }
 }
